@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Video files
+*.mp4
+*.avi
+*.mov
+
+# Data directories (temporary/generated content)
+uploads/
+static/clips/
+keyframes/
+keypoints/
+temp_keyframes/
+local_data/
+
+# OS files
+.DS_Store
+
+# Environment
+.env
