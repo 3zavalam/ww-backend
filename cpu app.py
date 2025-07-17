@@ -7,12 +7,10 @@ import boto3
 from botocore.exceptions import ClientError
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from werkzeug.utils import secure_filename
 
 SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")  # SQS queue URL
 SQS_DLQ_URL = os.getenv("SQS_DLQ_URL")  # Dead letter queue URL (optional)
 LAUNCH_TEMPLATE_ID = os.getenv("LAUNCH_TEMPLATE_ID", "lt-0fe372ebe8a9e42af")
-UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "/tmp/winnerway/uploads")
 STATIC_FOLDER = os.getenv("STATIC_FOLDER", "/tmp/winnerway/static")
 GPU_INSTANCE_ID = os.getenv("GPU_INSTANCE_ID")  # e.g. i-xxxxxxxx
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
@@ -25,7 +23,6 @@ ALLOWED_ORIGINS = os.getenv(
 IDLE_SHUTDOWN_MIN = int(os.getenv("IDLE_SHUTDOWN_MIN", 5))  # minutes
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 20))  # seconds between SQS polls
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(STATIC_FOLDER, exist_ok=True)
 
 sqs = boto3.client("sqs", region_name=AWS_REGION)
@@ -123,25 +120,18 @@ def maybe_stop_gpu():
         if idle_time > IDLE_SHUTDOWN_MIN * 60:
             app.logger.info("No jobs for a while—stopping GPU instance...")
 
-            # First, try to stop the instance normally
             try:
                 ec2.terminate_instances(InstanceIds=[GPU_INSTANCE_ID])
-                #ec2.stop_instances(InstanceIds=[GPU_INSTANCE_ID])
                 last_activity["time"] = time.time()
                 app.logger.info("GPU instance stopped successfully")
 
             except ClientError as stop_error:
-                # Check if it's the specific Spot instance error
                 if "UnsupportedOperation" in str(stop_error) and "one-time Spot Instance request" in str(stop_error):
                     app.logger.warning("Cannot stop one-time Spot instance, terminating instead...")
-
-                    # Terminate the one-time Spot instance
                     ec2.terminate_instances(InstanceIds=[GPU_INSTANCE_ID])
                     last_activity["time"] = time.time()
                     app.logger.info("One-time Spot instance terminated successfully")
-
                 else:
-                    # Re-raise if it's a different error
                     raise stop_error
 
     except ClientError as e:
@@ -150,35 +140,117 @@ def maybe_stop_gpu():
         app.logger.error(f"Unexpected error in maybe_stop_gpu: {e}")
 
 
-def upload_to_s3(local_path: str, key: str) -> str:
-    """Upload file to S3 with better error handling and verification"""
+@app.route("/upload-url", methods=["POST"])
+def generate_upload_url():
+    """Genera presigned URL para upload directo a S3"""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+    
+    email = data.get("email")
+    stroke_type = data.get("stroke_type", "forehand")
+    handedness = data.get("handedness", "right")
+    
+    if not email:
+        return jsonify({"error": "Missing email"}), 400
+    
+    if not S3_BUCKET:
+        return jsonify({"error": "S3_BUCKET not configured"}), 500
+    
     try:
-        # Check if local file exists
-        if not os.path.exists(local_path):
-            raise FileNotFoundError(f"Local file not found: {local_path}")
-
-        file_size = os.path.getsize(local_path)
-        app.logger.info(f"Uploading {local_path} ({file_size} bytes) to s3://{S3_BUCKET}/{key}")
-
-        # Upload file
-        s3.upload_file(local_path, S3_BUCKET, key)
-
-        # Verify upload
-        try:
-            response = s3.head_object(Bucket=S3_BUCKET, Key=key)
-            uploaded_size = response['ContentLength']
-            if uploaded_size != file_size:
-                raise Exception(f"Size mismatch: local={file_size}, s3={uploaded_size}")
-        except ClientError as e:
-            raise Exception(f"Upload verification failed: {e}")
-
-        s3_uri = f"s3://{S3_BUCKET}/{key}"
-        app.logger.info(f"Successfully uploaded and verified: {s3_uri}")
-        return s3_uri
-
+        # Generar clave única para S3
+        file_uuid = uuid.uuid4().hex
+        s3_key = f"uploads/{file_uuid}.mp4"
+        
+        # Generar presigned POST URL
+        presigned_post = s3.generate_presigned_post(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Fields={
+                "Content-Type": "video/mp4"
+            },
+            Conditions=[
+                {"Content-Type": "video/mp4"},
+                ["content-length-range", 1, 400 * 1024 * 1024]  # 1 byte a 400MB
+            ],
+            ExpiresIn=300  # 5 minutos
+        )
+        
+        app.logger.info(f"Generated presigned URL for {email}, key: {s3_key}")
+        
+        return jsonify({
+            "presigned": presigned_post,
+            "s3_key": s3_key
+        }), 200
+        
     except Exception as e:
-        app.logger.error(f"Failed to upload to S3: {e}")
-        raise
+        app.logger.error(f"Failed to generate presigned URL: {e}")
+        return jsonify({"error": "Failed to generate upload URL"}), 500
+
+
+@app.route("/notify", methods=["POST"])
+def notify_upload_complete():
+    """Recibe notificación de upload exitoso y encola el job"""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+    
+    s3_key = data.get("s3_key")
+    email = data.get("email")
+    stroke_type = data.get("stroke_type", "forehand")
+    handedness = data.get("handedness", "right")
+    original_filename = data.get("original_filename", "video.mp4")
+    file_size = data.get("file_size", 0)
+    
+    if not all([s3_key, email]):
+        return jsonify({"error": "Missing s3_key or email"}), 400
+    
+    if not S3_BUCKET:
+        return jsonify({"error": "S3_BUCKET not configured"}), 500
+    
+    try:
+        # Verificar que el objeto existe en S3
+        try:
+            s3.head_object(Bucket=S3_BUCKET, Key=s3_key)
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                return jsonify({"error": "File not found in S3"}), 404
+            raise
+        
+        # Construir s3_path para el worker
+        s3_path = f"s3://{S3_BUCKET}/{s3_key}"
+        
+        # Encolar el job (igual que antes)
+        job_id = enqueue({
+            "s3_path": s3_path,
+            "email": email,
+            "stroke_type": stroke_type,
+            "handedness": handedness,
+            "original_filename": original_filename,
+            "s3_key": s3_key,
+            "file_size": file_size
+        })
+        
+        # Arrancar GPU sin bloquear
+        def start_gpu_async():
+            try:
+                maybe_start_gpu()
+            except Exception as e:
+                app.logger.error(f"Error starting GPU: {e}")
+        
+        threading.Thread(target=start_gpu_async, daemon=True).start()
+        
+        app.logger.info(f"Job {job_id} queued for s3_path: {s3_path}")
+        
+        return jsonify({
+            "job_id": job_id,
+            "status": "queued",
+            "message": "Processing started"
+        }), 202
+        
+    except Exception as e:
+        app.logger.error(f"Failed to notify upload: {e}")
+        return jsonify({"error": "Failed to process notification"}), 500
 
 
 def check_job_results():
@@ -213,109 +285,6 @@ def check_job_results():
             time.sleep(POLL_INTERVAL)
 
 
-@app.route("/upload", methods=["POST"])
-def upload():
-    video = request.files.get("video")
-    email = request.form.get("email")
-    handed = request.form.get("handedness", "right")
-    stroke = request.form.get("stroke_type", "forehand")
-
-    if not video or not email:
-        return jsonify({"error": "Missing video file or email"}), 400
-
-    # Check if S3_BUCKET is configured
-    if not S3_BUCKET:
-        return jsonify({"error": "S3_BUCKET not configured"}), 500
-
-    try:
-        # Save file locally first
-        base, ext = os.path.splitext(secure_filename(video.filename))
-        file_name = f"{base}_{uuid.uuid4().hex}{ext}"
-        save_path = os.path.join(UPLOAD_FOLDER, file_name)
-
-        app.logger.info(f"Saving video to: {save_path}")
-        video.save(save_path)
-
-        # Check if file was actually saved
-        if not os.path.exists(save_path):
-            return jsonify({"error": "Failed to save file locally"}), 500
-
-        file_size = os.path.getsize(save_path)
-        app.logger.info(f"Saved upload to {save_path}, size: {file_size} bytes")
-
-        # Upload to S3 with better error handling
-        s3_key = f"uploads/{file_name}"
-        app.logger.info(f"Uploading to S3: bucket={S3_BUCKET}, key={s3_key}")
-
-        try:
-            # Upload with explicit content type
-            content_type = video.content_type or 'video/mp4'
-            s3.upload_file(
-                save_path,
-                S3_BUCKET,
-                s3_key,
-                ExtraArgs={
-                    'ContentType': content_type,
-                    'Metadata': {
-                        'original_filename': video.filename,
-                        'upload_timestamp': str(int(time.time()))
-                    }
-                }
-            )
-
-            # Verify the upload by checking if object exists
-            try:
-                s3.head_object(Bucket=S3_BUCKET, Key=s3_key)
-                app.logger.info(f"Successfully uploaded and verified: s3://{S3_BUCKET}/{s3_key}")
-            except ClientError as e:
-                app.logger.error(f"Upload verification failed: {e}")
-                return jsonify({"error": "S3 upload verification failed"}), 500
-
-        except ClientError as e:
-            app.logger.error(f"S3 upload failed: {e}")
-            # Don't clean up local file if S3 upload failed
-            return jsonify({"error": f"S3 upload failed: {str(e)}"}), 500
-
-        s3_path = f"s3://{S3_BUCKET}/{s3_key}"
-
-        # Enqueue the job
-        job_id = enqueue({
-            "s3_path": s3_path,
-            "email": email,
-            "stroke_type": stroke,
-            "handedness": handed,
-            "original_filename": video.filename,
-            "s3_key": s3_key,
-            "file_size": file_size
-        })
-
-        maybe_start_gpu()
-
-        # Clean up local file only after successful S3 upload
-        try:
-            os.remove(save_path)
-            app.logger.info(f"Cleaned up local file: {save_path}")
-        except OSError as e:
-            app.logger.warning(f"Failed to clean up local file: {e}")
-
-        return jsonify({
-            "job_id": job_id,
-            "s3_path": s3_path,
-            "s3_key": s3_key,
-            "file_size": file_size
-        }), 202
-
-    except Exception as e:
-        app.logger.error(f"Upload failed: {e}")
-        # Try to clean up local file if it exists
-        if 'save_path' in locals() and os.path.exists(save_path):
-            try:
-                os.remove(save_path)
-            except OSError:
-                pass
-        return jsonify({"error": f"Upload failed: {str(e)}"}), 500
-
-
 @app.route("/status/<job_id>")
 def status(job_id):
     state = job_status.get(job_id, "unknown")
@@ -337,77 +306,10 @@ def health():
     return jsonify({"status": "healthy", "timestamp": time.time()})
 
 
-@app.route("/start", methods=["POST"])
-def start():
-    if not GPU_INSTANCE_ID:
-        return jsonify({"error": "GPU_INSTANCE_ID not configured"}), 400
-
-    try:
-        # Get current instance info
-        info = get_gpu_instance_info()
-
-        # If instance doesn't exist or is terminated, we need to launch a new Spot instance
-        if "error" in info or info.get("state") == "terminated":
-            app.logger.info("Instance terminated or doesn't exist, launching new Spot instance...")
-            return launch_new_spot_instance()
-
-        current_state = info["state"]
-
-        # Check if already running or starting
-        if current_state == "running":
-            return jsonify({
-                "message": "GPU instance is already running",
-                "instance_info": info
-            })
-
-        if current_state == "pending":
-            return jsonify({
-                "message": "GPU instance is already starting",
-                "instance_info": info
-            })
-
-        # Check if in a state that can't be started
-        if current_state in ["stopping", "shutting-down"]:
-            return jsonify({
-                "error": f"Cannot start instance in state: {current_state}. Please wait for it to fully stop.",
-                "instance_info": info
-            }), 400
-
-        # Try to start the instance (works for regular instances and persistent Spot instances)
-        app.logger.info(f"Starting GPU instance {GPU_INSTANCE_ID}")
-
-        try:
-            start_response = ec2.start_instances(InstanceIds=[GPU_INSTANCE_ID])
-
-            # Update last activity
-            last_activity["time"] = time.time()
-
-            return jsonify({
-                "message": "GPU instance start command sent successfully",
-                "instance_id": GPU_INSTANCE_ID,
-                "previous_state": current_state,
-                "starting_instances": start_response.get("StartingInstances", []),
-                "note": "Instance may take 1-2 minutes to fully start"
-            })
-
-        except ClientError as start_error:
-            # If start fails (e.g., for terminated Spot instances), try launching new one
-            if "InvalidInstanceID.NotFound" in str(start_error) or "terminated" in str(start_error).lower():
-                app.logger.info("Start failed, instance likely terminated. Launching new Spot instance...")
-                return launch_new_spot_instance()
-            else:
-                raise start_error
-
-    except ClientError as e:
-        app.logger.error(f"Failed to start GPU instance: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
 def launch_new_spot_instance():
     try:
         app.logger.info(f"Launching new Spot instance using template {LAUNCH_TEMPLATE_ID}...")
 
-        # Launch instance using launch template with Spot pricing
         response = ec2.run_instances(
             MinCount=1,
             MaxCount=1,
@@ -426,12 +328,8 @@ def launch_new_spot_instance():
         )
 
         new_instance_id = response['Instances'][0]['InstanceId']
-
-        # Update the global instance ID
         global GPU_INSTANCE_ID
         GPU_INSTANCE_ID = new_instance_id
-
-        # Update last activity
         last_activity["time"] = time.time()
 
         app.logger.info(f"New Spot instance launched: {new_instance_id}")
@@ -448,115 +346,22 @@ def launch_new_spot_instance():
         return jsonify({"error": f"Failed to launch new Spot instance: {str(e)}"}), 500
 
 
-@app.route("/stop", methods=["POST"])
-def stop():
-    if not GPU_INSTANCE_ID:
-        return jsonify({"error": "GPU_INSTANCE_ID not configured"}), 400
-
-    try:
-        # Get current instance info
-        info = get_gpu_instance_info()
-        if "error" in info:
-            return jsonify(info), 500
-
-        current_state = info["state"]
-
-        # Check if already stopped or stopping
-        if current_state in ["stopped", "stopping"]:
-            return jsonify({
-                "message": f"GPU instance is already {current_state}",
-                "instance_info": info
-            })
-
-        # Check if in a state that can't be stopped
-        if current_state in ["pending", "shutting-down", "terminated"]:
-            return jsonify({
-                "error": f"Cannot stop instance in state: {current_state}",
-                "instance_info": info
-            }), 400
-
-        # Stop the instance
-        app.logger.info(f"Stopping GPU instance {GPU_INSTANCE_ID}")
-        stop_response = ec2.terminate_instances(InstanceIds=[GPU_INSTANCE_ID])
-
-        # Update last activity
-        last_activity["time"] = time.time()
-
-        return jsonify({
-            "message": "GPU instance stop command sent successfully",
-            "instance_id": GPU_INSTANCE_ID,
-            "previous_state": current_state,
-            "stopping_instances": stop_response.get("StoppingInstances", []),
-            "note": "Instance may take 1-2 minutes to fully stop"
-        })
-
-    except ClientError as e:
-        app.logger.error(f"Failed to stop GPU instance: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/istatus", methods=["GET"])
-def istatus():
-    if not GPU_INSTANCE_ID:
-        return jsonify({"error": "GPU_INSTANCE_ID not configured"}), 400
-
-    try:
-        info = get_gpu_instance_info()
-
-        if "error" in info:
-            return jsonify(info), 500
-
-        # Add additional useful information
-        info["last_activity"] = {
-            "timestamp": last_activity["time"],
-            "time_ago_seconds": int(time.time() - last_activity["time"]),
-            "formatted": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(last_activity["time"]))
-        }
-
-        info["idle_shutdown"] = {
-            "enabled": True,
-            "idle_threshold_minutes": IDLE_SHUTDOWN_MIN,
-            "time_until_shutdown_seconds": max(0, IDLE_SHUTDOWN_MIN * 60 - (time.time() - last_activity["time"]))
-        }
-
-        # Add queue information
-        try:
-            queue_attrs = sqs.get_queue_attributes(
-                QueueUrl=SQS_QUEUE_URL,
-                AttributeNames=['ApproximateNumberOfMessages', 'ApproximateNumberOfMessagesNotVisible']
-            )
-            info["sqs_status"] = {
-                "messages_in_queue": int(queue_attrs['Attributes']['ApproximateNumberOfMessages']),
-                "messages_in_flight": int(queue_attrs['Attributes']['ApproximateNumberOfMessagesNotVisible'])
-            }
-        except Exception as e:
-            info["sqs_status"] = {"error": str(e)}
-
-        return jsonify(info)
-
-    except ClientError as e:
-        app.logger.error(f"Failed to get GPU instance status: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
 def cleanup_old_jobs():
     while True:
         try:
             current_time = time.time()
-            cutoff_time = current_time - (24 * 60 * 60)  # 24 hours
+            cutoff_time = current_time - (24 * 60 * 60)
 
-            # Clean up jobs older than 24 hours
             jobs_to_remove = []
             for job_id in job_status.keys():
-                # This is a simple cleanup - in production, you'd want to track job creation time
-                if len(job_status) > 1000:  # Arbitrary limit
+                if len(job_status) > 1000:
                     jobs_to_remove.append(job_id)
 
-            for job_id in jobs_to_remove[:100]:  # Remove oldest 100
+            for job_id in jobs_to_remove[:100]:
                 job_status.pop(job_id, None)
                 job_results.pop(job_id, None)
 
-            time.sleep(3600)  # Run every hour
+            time.sleep(3600)
 
         except Exception as e:
             app.logger.error(f"Error in cleanup loop: {e}")
@@ -566,7 +371,7 @@ def cleanup_old_jobs():
 def idle_monitor():
     while True:
         try:
-            time.sleep(60)  # Check every minute
+            time.sleep(60)
             maybe_stop_gpu()
         except Exception as e:
             app.logger.error(f"Error in idle monitor: {e}")
