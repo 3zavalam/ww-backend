@@ -121,18 +121,18 @@ def maybe_stop_gpu():
             app.logger.info("No jobs for a while—stopping GPU instance...")
 
             try:
-                ec2.terminate_instances(InstanceIds=[GPU_INSTANCE_ID])
+                # Apaga la instancia (no la destruye)
+                ec2.stop_instances(InstanceIds=[GPU_INSTANCE_ID])
                 last_activity["time"] = time.time()
                 app.logger.info("GPU instance stopped successfully")
+                
+                # Evita nuevos intentos en el loop
+                global GPU_INSTANCE_ID
+                GPU_INSTANCE_ID = None
 
             except ClientError as stop_error:
-                if "UnsupportedOperation" in str(stop_error) and "one-time Spot Instance request" in str(stop_error):
-                    app.logger.warning("Cannot stop one-time Spot instance, terminating instead...")
-                    ec2.terminate_instances(InstanceIds=[GPU_INSTANCE_ID])
-                    last_activity["time"] = time.time()
-                    app.logger.info("One-time Spot instance terminated successfully")
-                else:
-                    raise stop_error
+                app.logger.error("Failed to stop GPU: %s", stop_error)
+                return
 
     except ClientError as e:
         app.logger.error(f"Failed to stop/terminate GPU instance: {e}")
@@ -371,7 +371,7 @@ def cleanup_old_jobs():
 def idle_monitor():
     while True:
         try:
-            time.sleep(60)
+            time.sleep(300)           # cada 5 min
             maybe_stop_gpu()
         except Exception as e:
             app.logger.error(f"Error in idle monitor: {e}")
