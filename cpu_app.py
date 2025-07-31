@@ -115,6 +115,7 @@ def maybe_start_gpu():
 
 
 def maybe_stop_gpu():
+    global GPU_INSTANCE_ID
     try:
         idle_time = time.time() - last_activity["time"]
         if idle_time > IDLE_SHUTDOWN_MIN * 60:
@@ -127,7 +128,6 @@ def maybe_stop_gpu():
                 app.logger.info("GPU instance stopped successfully")
                 
                 # Evita nuevos intentos en el loop
-                global GPU_INSTANCE_ID
                 GPU_INSTANCE_ID = None
 
             except ClientError as stop_error:
