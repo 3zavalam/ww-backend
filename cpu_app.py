@@ -12,7 +12,7 @@ SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL")  # SQS queue URL
 SQS_DLQ_URL = os.getenv("SQS_DLQ_URL")  # Dead letter queue URL (optional)
 LAUNCH_TEMPLATE_ID = os.getenv("LAUNCH_TEMPLATE_ID", "lt-0fe372ebe8a9e42af")
 STATIC_FOLDER = os.getenv("STATIC_FOLDER", "/tmp/winnerway/static")
-GPU_INSTANCE_ID = os.getenv("GPU_INSTANCE_ID")  # e.g. i-xxxxxxxx
+GPU_INSTANCE_ID = None  # Will be set from environment or created dynamically
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 S3_BUCKET = os.getenv("S3_BUCKET")  # e.g. winnerway-uploads
 S3_RESULTS_BUCKET = os.getenv("S3_RESULTS_BUCKET", S3_BUCKET)  # For storing results
@@ -95,6 +95,12 @@ def enqueue(payload: dict) -> str:
 
 
 def maybe_start_gpu():
+    global GPU_INSTANCE_ID
+    if not GPU_INSTANCE_ID:
+        app.logger.info("No GPU instance configured, launching new one...")
+        launch_new_spot_instance()
+        return
+    
     try:
         app.logger.info("Checking GPU instance status...")
         resp = ec2.describe_instances(
@@ -116,6 +122,9 @@ def maybe_start_gpu():
 
 def maybe_stop_gpu():
     global GPU_INSTANCE_ID
+    if not GPU_INSTANCE_ID:
+        return
+    
     try:
         idle_time = time.time() - last_activity["time"]
         if idle_time > IDLE_SHUTDOWN_MIN * 60:
@@ -381,6 +390,9 @@ def idle_monitor():
 if __name__ == "__main__":
     if not SQS_QUEUE_URL:
         raise ValueError("SQS_QUEUE_URL environment variable is required")
+    
+    # Initialize GPU_INSTANCE_ID from environment
+    GPU_INSTANCE_ID = os.getenv("GPU_INSTANCE_ID")
 
     # Start background threads
     result_thread = threading.Thread(target=check_job_results, daemon=True)
