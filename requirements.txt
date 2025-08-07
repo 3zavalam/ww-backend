@@ -68,6 +68,7 @@ StrEnum==0.4.15
 stripe==12.3.0
 supabase==2.16.0
 supafunc==0.10.1
+thread==2.0.5
 tqdm==4.67.1
 typing-inspection==0.4.1
 typing_extensions==4.14.1
