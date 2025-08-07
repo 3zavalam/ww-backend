@@ -1,44 +1,34 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# WinnerWay t3.py startup script
+# Single-worker deployment for t3.large
 
-# Winner Way t3.py startup script
-# Single worker, single machine deployment
-
-# Activate virtual environment if it exists
+# ── activate venv ──
 if [ -d ".venv" ]; then
-    echo "Activating virtual environment..."
-    source .venv/bin/activate
+  echo "Activating .venv…"
+  source .venv/bin/activate
 elif [ -d "venv" ]; then
-    echo "Activating virtual environment..."
-    source venv/bin/activate
+  echo "Activating venv…"
+  source venv/bin/activate
 else
-    echo "Warning: No virtual environment found (.venv or venv)"
+  echo "⚠️  No virtual environment found (.venv or venv)"
 fi
 
-export MAX_WORKERS=1
-export REDIS_HOST=localhost
-export REDIS_PORT=6379
+# ── load env vars ──
+if [ -f ".env" ]; then
+  export $(grep -v '^#' .env | xargs)
+fi
 
-# Set local paths relative to current directory
-export STATIC_FOLDER="$(pwd)/static"
-export KEYFRAME_FOLDER="$(pwd)/temp_keyframes"
-export KEYPOINT_FOLDER="$(pwd)/keypoints"
-export UPLOAD_FOLDER="$(pwd)/uploads"
+# ── runtime tweaks ──
+export MAX_WORKERS=${MAX_WORKERS:-1}      # default 1
+export TIMEOUT=${TIMEOUT:-600}            # default 600 s
 
-# Memory optimization settings for 6GB RAM instance
-export MAX_VIDEO_RESOLUTION=720p     # Use 480p for even more memory savings
-export MAX_VIDEO_DURATION=30         # Limit video clips to 30 seconds
-export ENABLE_VIDEO_OPTIMIZATION=true
+echo "Starting t3.py (workers=$MAX_WORKERS, timeout=$TIMEOUT)…"
 
-# Allow configurable timeout for longer video processing
-export TIMEOUT=600
-
-echo "Starting t3.py with single worker configuration..."
-
-# Run with Gunicorn - single worker, limited threads as per recommendations
-gunicorn --workers 1 --threads 2 \
-        --timeout 600 \
-        --bind 0.0.0.0:5050 \
-        --worker-class gthread \
-        --access-logfile - \
-        --error-logfile - \
-        t3:app
+gunicorn t3:app \
+  --workers "$MAX_WORKERS" \
+  --threads 2 \
+  --timeout "$TIMEOUT" \
+  --bind 0.0.0.0:5050 \
+  --worker-class gthread \
+  --access-logfile - \
+  --error-logfile -
