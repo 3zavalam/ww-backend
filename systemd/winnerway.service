@@ -1,0 +1,46 @@
+[Unit]
+Description=WinnerWay Flask API Server
+After=network.target redis.service
+Wants=redis.service
+
+[Service]
+Type=exec
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/WW/backend
+Environment=PATH=/home/ubuntu/WW/backend/.venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-/home/ubuntu/WW/backend/.env
+
+# Gunicorn settings
+ExecStart=/home/ubuntu/WW/backend/.venv/bin/gunicorn \
+    --bind 0.0.0.0:5050 \
+    --workers 1 \
+    --threads 2 \
+    --timeout 600 \
+    --worker-class gthread \
+    --access-logfile - \
+    --error-logfile - \
+    t3:app
+
+# Service management
+Restart=always
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=winnerway
+
+# Security
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/WW/backend/static
+ReadWritePaths=/home/ubuntu/WW/backend/uploads
+ReadWritePaths=/home/ubuntu/WW/backend/temp_keyframes
+ReadWritePaths=/home/ubuntu/WW/backend/keypoints
+
+[Install]
+WantedBy=multi-user.target

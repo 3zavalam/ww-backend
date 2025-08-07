@@ -1,0 +1,43 @@
+[Unit]
+Description=WinnerWay Redis Video Processing Worker
+After=network.target redis.service
+Requires=redis.service
+
+[Service]
+Type=exec
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/WW/backend
+Environment=PATH=/home/ubuntu/WW/backend/.venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-/home/ubuntu/WW/backend/.env
+
+# Worker service
+ExecStart=/home/ubuntu/WW/backend/.venv/bin/python /home/ubuntu/WW/backend/worker_service.py
+
+# Service management
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ww-worker
+
+# Security
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/WW/backend/static
+ReadWritePaths=/home/ubuntu/WW/backend/uploads
+ReadWritePaths=/home/ubuntu/WW/backend/temp_keyframes
+ReadWritePaths=/home/ubuntu/WW/backend/keypoints
+ReadWritePaths=/home/ubuntu/WW/backend/data
+
+# Process limits (for video processing)
+LimitNOFILE=4096
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

@@ -6,7 +6,6 @@ import threading
 import shutil
 import subprocess
 import redis
-from queue import Queue, Empty
 from uuid import uuid4
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -73,8 +72,10 @@ def ensure_directories():
 # Global state
 job_status = {}
 job_results = {}
-job_queue = Queue()
 last_activity = {"time": time.time()}
+
+# Redis queue name
+REDIS_QUEUE_NAME = "video_jobs_queue"
 
 
 def safe_rm(path):
@@ -359,27 +360,38 @@ def process_video_job(job_data):
         app.logger.info(f"Memory cleanup completed for job {job_id}")
 
 
-def worker_thread():
-    """Single worker thread that processes jobs from the queue"""
-    app.logger.info("Worker thread started")
+def redis_worker_loop():
+    """Redis-based worker that processes jobs from Redis queue"""
+    app.logger.info("Redis worker started")
+    redis_conn = get_redis_connection()
+    
+    if not redis_conn:
+        app.logger.error("Cannot start worker: Redis connection failed")
+        return
     
     while True:
         try:
-            # Get job from queue with timeout
-            job_data = job_queue.get(timeout=30)
+            # BLPOP with 30 second timeout
+            result = redis_conn.blpop(REDIS_QUEUE_NAME, timeout=30)
             
-            if job_data is None:  # Shutdown signal
-                break
+            if result is None:  # Timeout, continue waiting
+                continue
                 
-            process_video_job(job_data)
-            job_queue.task_done()
+            # Parse job data
+            queue_name, job_json = result
+            job_data = json.loads(job_json)
             
-        except Empty:
-            # No jobs in queue, continue waiting
+            app.logger.info(f"Processing job {job_data['id']} from Redis queue")
+            process_video_job(job_data)
+            
+        except json.JSONDecodeError as e:
+            app.logger.error(f"Invalid JSON in Redis queue: {e}")
             continue
         except Exception as e:
-            app.logger.error(f"Worker thread error: {e}")
+            app.logger.error(f"Redis worker error: {e}")
             time.sleep(5)
+            # Reconnect Redis if needed
+            redis_conn = get_redis_connection()
 
 
 @app.route("/upload", methods=["POST"])
@@ -419,7 +431,7 @@ def upload_video():
         app.logger.info(f"Uploaded video: {file.filename} ({file_ext}) -> {filename}")
 
 
-        # Queue the job
+        # Queue the job in Redis
         job_data = {
             "id": job_id,
             "video_path": video_path,
@@ -430,10 +442,23 @@ def upload_video():
         }
         
         job_status[job_id] = "queued"
-        job_queue.put(job_data)
-        last_activity["time"] = time.time()
         
-        app.logger.info(f"Job {job_id} queued for processing")
+        # Push to Redis queue
+        redis_conn = get_redis_connection()
+        if redis_conn:
+            try:
+                redis_conn.lpush(REDIS_QUEUE_NAME, json.dumps(job_data))
+                app.logger.info(f"Job {job_id} queued in Redis for processing")
+            except Exception as e:
+                app.logger.error(f"Failed to queue job in Redis: {e}")
+                job_status[job_id] = "error"
+                return jsonify({"error": "Failed to queue job for processing"}), 500
+        else:
+            app.logger.error("Redis connection failed, cannot queue job")
+            job_status[job_id] = "error"
+            return jsonify({"error": "Service temporarily unavailable"}), 503
+            
+        last_activity["time"] = time.time()
         
         return jsonify({
             "job_id": job_id,
@@ -468,10 +493,22 @@ def serve_static(filename):
 @app.route("/health")
 def health():
     """Health check endpoint"""
+    redis_conn = get_redis_connection()
+    queue_size = 0
+    redis_status = "disconnected"
+    
+    if redis_conn:
+        try:
+            queue_size = redis_conn.llen(REDIS_QUEUE_NAME)
+            redis_status = "connected"
+        except:
+            redis_status = "error"
+    
     return jsonify({
         "status": "healthy", 
         "timestamp": time.time(),
-        "queue_size": job_queue.qsize(),
+        "redis_status": redis_status,
+        "queue_size": queue_size,
         "active_jobs": len([j for j in job_status.values() if j in ["queued", "processing"]])
     })
 
@@ -501,19 +538,30 @@ def cleanup_old_jobs():
             time.sleep(3600)
 
 
-if __name__ == "__main__":
-    app.logger.info(f"Starting t3.py with MAX_WORKERS={MAX_WORKERS}")
+def start_redis_worker():
+    """Start Redis worker thread - called by worker_service.py"""
+    app.logger.info(f"Starting Redis worker with MAX_WORKERS={MAX_WORKERS}")
     
     # Ensure directories exist
     ensure_directories()
     
-    # Start single worker thread
-    worker = threading.Thread(target=worker_thread, daemon=True)
+    # Start Redis worker thread
+    worker = threading.Thread(target=redis_worker_loop, daemon=True)
     worker.start()
     
     # Start cleanup thread
     cleanup_thread = threading.Thread(target=cleanup_old_jobs, daemon=True)
     cleanup_thread.start()
+    
+    app.logger.info("Redis worker threads started successfully")
+    return worker, cleanup_thread
+
+
+if __name__ == "__main__":
+    app.logger.info(f"Starting t3.py with MAX_WORKERS={MAX_WORKERS}")
+    
+    # When running directly (not with Gunicorn), start Redis workers
+    start_redis_worker()
     
     app.logger.info("t3.py server starting on port 5050...")
     
