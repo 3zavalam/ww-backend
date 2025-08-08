@@ -40,6 +40,9 @@ MAX_VIDEO_RESOLUTION = os.getenv("MAX_VIDEO_RESOLUTION", "720p")  # 720p or 480p
 MAX_VIDEO_DURATION = int(os.getenv("MAX_VIDEO_DURATION", 30))  # seconds
 ENABLE_VIDEO_OPTIMIZATION = os.getenv("ENABLE_VIDEO_OPTIMIZATION", "true").lower() == "true"
 
+# Job TTL settings
+JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", 3600))  # 1 hour default
+
 # Initialize Flask first
 app = Flask(__name__, static_folder=STATIC_FOLDER)
 CORS(app, origins=ALLOWED_ORIGINS)
@@ -59,6 +62,34 @@ def get_redis_connection():
             app.logger.warning(f"Redis connection failed: {e}")
             r = None
     return r
+
+def redis_set_status(job_id, status, **extra):
+    """Set job status in Redis with TTL"""
+    redis_conn = get_redis_connection()
+    if not redis_conn:
+        app.logger.error(f"Cannot set status for job {job_id}: Redis connection failed")
+        return False
+    
+    try:
+        # Create job key
+        job_key = f"job:{job_id}"
+        
+        # Set status and extra fields using HSET
+        fields_to_set = {"status": status}
+        fields_to_set.update(extra)
+        
+        # HSET job:<id> field1 value1 field2 value2 ...
+        redis_conn.hset(job_key, mapping=fields_to_set)
+        
+        # Set TTL for the job key
+        redis_conn.expire(job_key, JOB_TTL_SECONDS)
+        
+        app.logger.info(f"Set Redis status for job {job_id}: {status}")
+        return True
+        
+    except Exception as e:
+        app.logger.error(f"Failed to set Redis status for job {job_id}: {e}")
+        return False
 
 def ensure_directories():
     """Create directories when needed"""
@@ -440,6 +471,18 @@ def upload_video():
             "handedness": handedness,
             "original_filename": file.filename
         }
+        
+        # Set status in Redis with job metadata
+        redis_set_status(
+            job_id, 
+            "queued", 
+            email=email,
+            stroke_type=stroke_type,
+            handedness=handedness,
+            original_filename=file.filename,
+            path=video_path,
+            updated_at=time.time()
+        )
         
         job_status[job_id] = "queued"
         
