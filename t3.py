@@ -6,6 +6,7 @@ import threading
 import shutil
 import subprocess
 import redis
+import boto3
 from uuid import uuid4
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -43,12 +44,19 @@ ENABLE_VIDEO_OPTIMIZATION = os.getenv("ENABLE_VIDEO_OPTIMIZATION", "true").lower
 # Job TTL settings
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", 3600))  # 1 hour default
 
+# S3 settings
+S3_BUCKET = os.getenv("S3_BUCKET", "winnerway-results-videos-001")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
 # Initialize Flask first
 app = Flask(__name__, static_folder=STATIC_FOLDER)
 CORS(app, origins=ALLOWED_ORIGINS)
 
 # Initialize Redis connection (will be tested on first use)
 r = None
+
+# Initialize S3 client (will be tested on first use)
+s3_client = None
 
 def get_redis_connection():
     """Get Redis connection with lazy initialization"""
@@ -62,6 +70,18 @@ def get_redis_connection():
             app.logger.warning(f"Redis connection failed: {e}")
             r = None
     return r
+
+def get_s3_client():
+    """Get S3 client with lazy initialization"""
+    global s3_client
+    if s3_client is None:
+        try:
+            s3_client = boto3.client("s3", region_name=AWS_REGION)
+            app.logger.info("S3 client initialized")
+        except Exception as e:
+            app.logger.warning(f"S3 client initialization failed: {e}")
+            s3_client = None
+    return s3_client
 
 def redis_set_status(job_id, status, **extra):
     """Set job status in Redis with TTL"""
@@ -81,8 +101,9 @@ def redis_set_status(job_id, status, **extra):
         # HSET job:<id> field1 value1 field2 value2 ...
         redis_conn.hset(job_key, mapping=fields_to_set)
         
-        # Set TTL for the job key
-        redis_conn.expire(job_key, JOB_TTL_SECONDS)
+        # Set TTL only if key doesn't already have one (preserve existing TTL)
+        if redis_conn.ttl(job_key) == -1:  # -1 means no expiration set
+            redis_conn.expire(job_key, JOB_TTL_SECONDS)
         
         app.logger.info(f"Set Redis status for job {job_id}: {status}")
         return True
@@ -363,8 +384,66 @@ def process_video_job(job_data):
             "reference_url": reference_url
         }
         
-        # Update status in Redis and memory
-        redis_set_status(job_id, "done", updated_at=time.time())
+        # 8) Upload result to S3
+        s3_client = get_s3_client()
+        result_key = f"results/{job_id}/result.json"
+        
+        if s3_client:
+            try:
+                # Upload result.json to S3
+                s3_client.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=result_key,
+                    Body=json.dumps(result, indent=2),
+                    ContentType="application/json"
+                )
+                app.logger.info(f"Job {job_id} result uploaded to S3: {result_key}")
+                
+                # Optional: Upload clips and keyframes to S3
+                try:
+                    # Upload processed video clip if it exists
+                    clip_path = os.path.join(CLIP_FOLDER, f"{video_name}.mp4")
+                    if os.path.exists(clip_path):
+                        clip_s3_key = f"results/{job_id}/clips/{job_id}.mp4"
+                        with open(clip_path, 'rb') as clip_file:
+                            s3_client.put_object(
+                                Bucket=S3_BUCKET,
+                                Key=clip_s3_key,
+                                Body=clip_file,
+                                ContentType="video/mp4"
+                            )
+                        app.logger.info(f"Job {job_id} clip uploaded to S3: {clip_s3_key}")
+                    
+                    # Upload keyframes if they exist
+                    for phase in ["preparation", "impact", "follow_through"]:
+                        keyframe_path = os.path.join(PUBLIC_KF_FOLDER, video_name, f"{phase}.jpg")
+                        if os.path.exists(keyframe_path):
+                            keyframe_s3_key = f"results/{job_id}/keyframes/{phase}.jpg"
+                            with open(keyframe_path, 'rb') as keyframe_file:
+                                s3_client.put_object(
+                                    Bucket=S3_BUCKET,
+                                    Key=keyframe_s3_key,
+                                    Body=keyframe_file,
+                                    ContentType="image/jpeg"
+                                )
+                            app.logger.info(f"Job {job_id} keyframe {phase} uploaded to S3: {keyframe_s3_key}")
+                            
+                except Exception as e:
+                    app.logger.warning(f"Optional S3 upload failed for job {job_id}: {e}")
+                
+                # Update status in Redis and memory with result_key
+                redis_set_status(job_id, "done", result_key=result_key, updated_at=time.time())
+                app.logger.info(f"Job {job_id} result_key saved to Redis: {result_key}")
+                
+            except Exception as e:
+                app.logger.error(f"Failed to upload result to S3 for job {job_id}: {e}")
+                # Still mark as done but without result_key
+                redis_set_status(job_id, "done", updated_at=time.time())
+        else:
+            app.logger.warning(f"S3 client not available for job {job_id}")
+            # Still mark as done but without result_key
+            redis_set_status(job_id, "done", updated_at=time.time())
+        
         job_status[job_id] = "done"
         job_results[job_id] = result
         last_activity["time"] = time.time()
