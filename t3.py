@@ -256,8 +256,10 @@ def process_video_job(job_data):
     
     app.logger.info(f"Processing job {job_id} for {email}")
     
-    # Update status
+    # Update status in Redis and memory
+    redis_set_status(job_id, "processing", updated_at=time.time())
     job_status[job_id] = "processing"
+    app.logger.info(f"Job {job_id} status: processing")
     
     # Generate unique identifiers
     uid = uuid4().hex
@@ -361,16 +363,21 @@ def process_video_job(job_data):
             "reference_url": reference_url
         }
         
+        # Update status in Redis and memory
+        redis_set_status(job_id, "done", updated_at=time.time())
         job_status[job_id] = "done"
         job_results[job_id] = result
         last_activity["time"] = time.time()
         
-        app.logger.info(f"Job {job_id} completed successfully")
+        app.logger.info(f"Job {job_id} status: done")
 
     except Exception as e:
         app.logger.error(f"Error processing job {job_id}: {e}")
+        # Update status in Redis and memory
+        redis_set_status(job_id, "error", message=str(e), updated_at=time.time())
         job_status[job_id] = "error"
         job_results[job_id] = {"error": str(e)}
+        app.logger.info(f"Job {job_id} status: error")
     
     finally:
         # Aggressive cleanup for memory conservation
